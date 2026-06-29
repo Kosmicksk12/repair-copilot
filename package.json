@@ -6,7 +6,9 @@
     "dev": "next dev",
     "build": "next build",
     "start": "next start",
-    "lint": "eslint"
+    "lint": "eslint",
+    "generate:knowledge": "powershell -ExecutionPolicy Bypass -File scripts/generate-repair-knowledge.ps1",
+    "sanitize:knowledge": "node scripts/sanitize-repair-knowledge.mjs"
   },
   "dependencies": {
     "next": "16.2.7",
