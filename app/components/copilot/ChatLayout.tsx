@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { searchInventoryForCopilot } from "./actions";
+import { createOrderForCopilot, searchInventoryForCopilot, searchOrdersForCopilot } from "./actions";
 import ChatInput from "./ChatInput";
 import ConversationHeader from "./ConversationHeader";
 import ConversationSidebar from "./ConversationSidebar";
@@ -17,6 +17,36 @@ import {
   welcomeMessages,
 } from "./mock-data";
 import type { ChatMessage, Conversation, DemoStage, SuggestionSet } from "./types";
+
+type ServiceOrderDraft = {
+  clientName?: string;
+  clientPhone?: string;
+  brand?: string;
+  model?: string;
+  color?: string;
+  reportedDamage?: string;
+  physicalCondition?: string;
+};
+
+const REQUIRED_ORDER_FIELDS: Array<keyof ServiceOrderDraft> = [
+  "clientName",
+  "clientPhone",
+  "brand",
+  "model",
+  "color",
+  "reportedDamage",
+  "physicalCondition",
+];
+
+const ORDER_FIELD_LABELS: Record<keyof ServiceOrderDraft, string> = {
+  clientName: "cliente",
+  clientPhone: "teléfono",
+  brand: "marca",
+  model: "modelo",
+  color: "color",
+  reportedDamage: "daño reportado",
+  physicalCondition: "condición física",
+};
 
 function currentTime() {
   return new Intl.DateTimeFormat("es-CO", { hour: "2-digit", minute: "2-digit" }).format(new Date());
@@ -46,6 +76,90 @@ function isInventoryQuery(content: string) {
   ].some((keyword) => text.includes(keyword));
 }
 
+function isOrderQuery(content: string) {
+  const text = normalizeIntent(content);
+  return /\bfp-\d{1,6}\b/.test(text) || [
+    "orden",
+    "ordenes",
+    "servicio",
+    "reparacion",
+    "cliente",
+    "equipo",
+    "estado",
+  ].some((keyword) => text.includes(keyword));
+}
+
+function isCreateOrderIntent(content: string) {
+  const text = normalizeIntent(content);
+  return [
+    "crear orden",
+    "nueva orden",
+    "registrar orden",
+    "abrir orden",
+    "generar orden",
+    "crear servicio",
+  ].some((keyword) => text.includes(keyword));
+}
+
+function extractLabeledValue(content: string, labels: string[]) {
+  const labelPattern = labels.join("|");
+  const nextLabels = [
+    "cliente",
+    "nombre",
+    "telefono",
+    "teléfono",
+    "celular",
+    "marca",
+    "modelo",
+    "equipo",
+    "color",
+    "dano",
+    "daño",
+    "problema",
+    "falla",
+    "condicion",
+    "condición",
+    "estado fisico",
+    "estado físico",
+  ].join("|");
+  const match = content.match(new RegExp(`(?:${labelPattern})\\s*[:=-]?\\s*(.+?)(?=\\s+(?:${nextLabels})\\s*[:=-]?|$)`, "i"));
+  return match?.[1]?.trim();
+}
+
+function parseOrderDraft(content: string): ServiceOrderDraft {
+  const phone = content.match(/(?:\+?\d[\d\s-]{6,}\d)/)?.[0]?.replace(/\s+/g, " ").trim();
+  return {
+    clientName: extractLabeledValue(content, ["cliente", "nombre"]),
+    clientPhone: extractLabeledValue(content, ["telefono", "teléfono", "celular"]) ?? phone,
+    brand: extractLabeledValue(content, ["marca"]),
+    model: extractLabeledValue(content, ["modelo", "equipo"]),
+    color: extractLabeledValue(content, ["color"]),
+    reportedDamage: extractLabeledValue(content, ["dano", "daño", "problema", "falla"]),
+    physicalCondition: extractLabeledValue(content, ["condicion", "condición", "estado fisico", "estado físico"]),
+  };
+}
+
+function mergeOrderDraft(current: ServiceOrderDraft | undefined, next: ServiceOrderDraft) {
+  return Object.fromEntries(
+    Object.entries({ ...(current ?? {}), ...next }).filter(([, value]) => typeof value === "string" && value.trim()),
+  ) as ServiceOrderDraft;
+}
+
+function missingOrderFields(draft: ServiceOrderDraft) {
+  return REQUIRED_ORDER_FIELDS.filter((field) => !draft[field]?.trim());
+}
+
+function buildMissingOrderMessage(missing: Array<keyof ServiceOrderDraft>) {
+  return `Para crear la orden necesito estos datos obligatorios: ${missing.map((field) => ORDER_FIELD_LABELS[field]).join(", ")}.\n\nPuedes responder en este formato:\nCliente: \nTeléfono: \nMarca: \nModelo: \nColor: \nDaño reportado: \nCondición física:`;
+}
+
+function formatOrderDate(value: string) {
+  return new Intl.DateTimeFormat("es-CO", {
+    dateStyle: "medium",
+    timeStyle: "short",
+  }).format(new Date(value));
+}
+
 export default function ChatLayout() {
   const [conversations, setConversations] = useState<Conversation[]>(mockConversations);
   const [activeId, setActiveId] = useState(mockConversations[0].id);
@@ -54,6 +168,7 @@ export default function ChatLayout() {
   const [isTyping, setIsTyping] = useState(false);
   const [suggestions, setSuggestions] = useState<SuggestionSet | null>(null);
   const [stages, setStages] = useState<Record<string, DemoStage>>({ [mockConversations[0].id]: "device" });
+  const [orderDrafts, setOrderDrafts] = useState<Record<string, ServiceOrderDraft>>({});
   const timerRef = useRef<number | null>(null);
   const sequenceRef = useRef(0);
 
@@ -91,9 +206,13 @@ export default function ChatLayout() {
     try {
       const results = await searchInventoryForCopilot(content);
       const now = currentTime();
+      const shouldAskBrand = results.some((item) => item.requiereMarca);
+      const intro = shouldAskBrand
+        ? "Encontré estos tipos disponibles en el inventario local. ¿Qué marca necesitas?"
+        : `Encontré ${results.length} resultado${results.length === 1 ? "" : "s"} en el inventario local.`;
       const messages: ChatMessage[] = results.length > 0
         ? [
-          { id: nextId("assistant"), role: "assistant", type: "text", content: `Encontré ${results.length} resultado${results.length === 1 ? "" : "s"} en el inventario local.`, createdAt: now },
+          { id: nextId("assistant"), role: "assistant", type: "text", content: intro, createdAt: now },
           ...results.map((item, index): ChatMessage => ({
             id: nextId("inventory"),
             role: "assistant",
@@ -101,8 +220,10 @@ export default function ChatLayout() {
             data: {
               id: `inventory-${index}-${item.nombre}`,
               name: item.nombre,
-              sku: item.categoria,
-              compatibility: [item.marca, item.modelo].filter(Boolean).join(" · ") || item.categoria,
+              sku: item.tipoResultado === "type" ? item.categoria : [item.categoria, item.color].filter(Boolean).join(" · "),
+              compatibility: item.tipoResultado === "type"
+                ? `Marcas: ${(item.marcasDisponibles ?? []).join(", ") || "por confirmar"}`
+                : [item.marca, item.modelo, item.color].filter(Boolean).join(" · ") || item.categoria,
               stock: item.stock,
               price: item.precioVenta ?? 0,
               location: "Inventario local",
@@ -120,12 +241,94 @@ export default function ChatLayout() {
     }
   };
 
+  const handleOrderQuery = async (conversationId: string, content: string) => {
+    setIsTyping(true);
+    try {
+      const results = await searchOrdersForCopilot(content);
+      const now = currentTime();
+      const contentText = results.length > 0
+        ? [
+          `Encontré ${results.length} orden${results.length === 1 ? "" : "es"} de servicio local${results.length === 1 ? "" : "es"}.`,
+          "",
+          ...results.map((order) => [
+            `Orden: ${order.numeroOrden}`,
+            `Cliente: ${order.cliente}`,
+            `Equipo: ${order.equipo}`,
+            `Estado: ${order.estado}`,
+            `Fecha: ${formatOrderDate(order.fecha)}`,
+          ].join("\n")),
+        ].join("\n\n")
+        : "No encontré órdenes de servicio locales para esa consulta.";
+
+      appendMessages(conversationId, [{ id: nextId("assistant"), role: "assistant", type: "text", content: contentText, createdAt: now }], results.length > 0 ? "Resultados de órdenes locales." : "Sin resultados de órdenes.");
+    } catch {
+      appendMessages(conversationId, [{ id: nextId("alert"), role: "assistant", type: "alert", data: { tone: "warning", title: "No pude consultar las órdenes", description: "La consulta local no se completó. Intenta de nuevo o revisa las órdenes de servicio." }, createdAt: currentTime() }], "No pude consultar las órdenes.");
+    } finally {
+      setIsTyping(false);
+    }
+  };
+
+  const handleCreateOrderFlow = async (conversationId: string, content: string) => {
+    const mergedDraft = mergeOrderDraft(orderDrafts[conversationId], parseOrderDraft(content));
+    const missing = missingOrderFields(mergedDraft);
+
+    if (missing.length > 0) {
+      setOrderDrafts((current) => ({ ...current, [conversationId]: mergedDraft }));
+      appendMessages(conversationId, [{ id: nextId("assistant"), role: "assistant", type: "text", content: buildMissingOrderMessage(missing), createdAt: currentTime() }], "Faltan datos para crear la orden.");
+      return;
+    }
+
+    setIsTyping(true);
+    try {
+      const order = await createOrderForCopilot({
+        clientName: mergedDraft.clientName,
+        clientPhone: mergedDraft.clientPhone,
+        brand: mergedDraft.brand,
+        model: mergedDraft.model,
+        color: mergedDraft.color,
+        reportedDamage: mergedDraft.reportedDamage,
+        physicalCondition: mergedDraft.physicalCondition,
+        accessories: [],
+        observations: "",
+        status: "Recibido",
+      });
+      setOrderDrafts((current) => {
+        const next = { ...current };
+        delete next[conversationId];
+        return next;
+      });
+      appendMessages(conversationId, [{ id: nextId("assistant"), role: "assistant", type: "text", content: [
+        "Orden de servicio creada correctamente.",
+        "",
+        `Número de orden: ${order.numeroOrden}`,
+        `Cliente: ${order.cliente}`,
+        `Equipo: ${order.equipo}`,
+        `Estado inicial: ${order.estadoInicial}`,
+        `Fecha: ${formatOrderDate(order.fecha)}`,
+      ].join("\n"), createdAt: currentTime() }], `Orden creada: ${order.numeroOrden}`);
+    } catch {
+      appendMessages(conversationId, [{ id: nextId("alert"), role: "assistant", type: "alert", data: { tone: "warning", title: "No pude crear la orden", description: "La orden local no se completó. Revisa los datos obligatorios e intenta de nuevo." }, createdAt: currentTime() }], "No pude crear la orden.");
+    } finally {
+      setIsTyping(false);
+    }
+  };
+
   const handleSend = async (content: string) => {
     if (!activeConversation || isTyping) return;
     const conversationId = activeConversation.id;
     const userMessage: ChatMessage = { id: nextId("user"), role: "user", type: "text", content, createdAt: currentTime() };
     appendMessages(conversationId, [userMessage], content);
     setSuggestions(null);
+
+    if (orderDrafts[conversationId] || isCreateOrderIntent(content)) {
+      await handleCreateOrderFlow(conversationId, content);
+      return;
+    }
+
+    if (isOrderQuery(content)) {
+      await handleOrderQuery(conversationId, content);
+      return;
+    }
 
     if (isInventoryQuery(content)) {
       await handleInventoryQuery(conversationId, content);

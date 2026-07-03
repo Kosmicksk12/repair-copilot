@@ -1,9 +1,10 @@
 import {
-  mockCreatedOrder,
-  mockRegisteredSale,
   mockUpdatedOrder,
   mockUpdatedStock,
 } from "./mock-data";
+import { createServiceOrder, validateCreateInput } from "../../service-orders-store";
+import { registerInventorySale } from "../../sales-store";
+import type { SaleRecord } from "../../sales-types";
 import type { CopilotToolDefinition, CopilotToolInput } from "./types";
 import { createMockToolResult } from "./utils";
 
@@ -12,12 +13,43 @@ export type MutationToolInput = CopilotToolInput & {
   payload?: Record<string, unknown>;
 };
 
-export const createOrder: CopilotToolDefinition<MutationToolInput, typeof mockCreatedOrder> = {
+export type CreateOrderToolResult = {
+  numeroOrden: string;
+  cliente: string;
+  equipo: string;
+  estadoInicial: string;
+  fecha: string;
+};
+
+export const createOrder: CopilotToolDefinition<MutationToolInput, CreateOrderToolResult> = {
   name: "createOrder",
-  description: "Prepara la creación de una orden. Actualmente devuelve una orden mock.",
+  description: "Crea una orden de servicio local reutilizando el módulo existente de órdenes.",
   category: "mutation",
-  async execute() {
-    return createMockToolResult("createOrder", mockCreatedOrder, "Orden mock creada correctamente.");
+  async execute(input) {
+    const validated = validateCreateInput(input?.payload ?? {});
+
+    if ("error" in validated) {
+      throw new Error(validated.error);
+    }
+
+    const order = createServiceOrder(validated);
+
+    return {
+      ok: true,
+      tool: "createOrder",
+      data: {
+        numeroOrden: order.orderNumber,
+        cliente: order.clientName,
+        equipo: [order.brand, order.model].filter(Boolean).join(" "),
+        estadoInicial: order.status,
+        fecha: order.createdAt,
+      },
+      message: "Orden de servicio local creada correctamente.",
+      meta: {
+        mocked: false,
+        executedAt: new Date().toISOString(),
+      },
+    };
   },
 };
 
@@ -30,12 +62,25 @@ export const updateOrder: CopilotToolDefinition<MutationToolInput, typeof mockUp
   },
 };
 
-export const registerSale: CopilotToolDefinition<MutationToolInput, typeof mockRegisteredSale> = {
+export const registerSale: CopilotToolDefinition<MutationToolInput, SaleRecord> = {
   name: "registerSale",
-  description: "Prepara el registro de una venta. Actualmente devuelve una venta mock.",
+  description: "Registra una venta local de inventario y descuenta stock.",
   category: "mutation",
-  async execute() {
-    return createMockToolResult("registerSale", mockRegisteredSale, "Venta mock registrada correctamente.");
+  async execute(input) {
+    const productId = typeof input?.payload?.productId === "string" ? input.payload.productId : "";
+    const quantity = typeof input?.payload?.quantity === "number" ? input.payload.quantity : Number(input?.payload?.quantity);
+    const sale = registerInventorySale({ productId, quantity });
+
+    return {
+      ok: true,
+      tool: "registerSale",
+      data: sale,
+      message: "Venta local registrada correctamente.",
+      meta: {
+        mocked: false,
+        executedAt: new Date().toISOString(),
+      },
+    };
   },
 };
 
