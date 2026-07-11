@@ -7,10 +7,14 @@ import type {
   RepairStatus,
   ServiceOrder,
   ServiceOrderListFilters,
+  ServiceOrderPart,
+  ServiceOrderStatusHistoryEntry,
   ServiceOrderStore,
   UpdateServiceOrderInput,
 } from "./service-order-types";
 import { DEFAULT_WARRANTY_DAYS } from "./warranty-terms";
+import { listInventoryProducts } from "./inventory-store";
+import { getRepairSaleByOrderNumber, registerInventorySale, registerRepairSale } from "./sales-store";
 
 const DATA_DIR = join(process.cwd(), "data");
 const STORE_PATH = join(DATA_DIR, "service-orders.json");
@@ -35,6 +39,88 @@ function persistStore(store: ServiceOrderStore): void {
     mkdirSync(DATA_DIR, { recursive: true });
   }
   writeFileSync(STORE_PATH, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+}
+
+function toMoney(value: unknown): number {
+  const amount = typeof value === "number" ? value : Number(value);
+  return Number.isFinite(amount) ? Math.max(0, amount) : 0;
+}
+
+function normalizeParts(parts: ServiceOrderPart[] | undefined): ServiceOrderPart[] {
+  if (!Array.isArray(parts)) return [];
+
+  const products = listInventoryProducts();
+  const normalized: ServiceOrderPart[] = [];
+
+  for (const part of parts) {
+    const product = products.find((item) => item.id === part.productId);
+    const quantity = Math.max(1, Math.trunc(toMoney(part.quantity)));
+    const unitPrice = toMoney(part.unitPrice || product?.salePrice || product?.minimumPrice || 0);
+    const productName = product?.name ?? part.productName;
+    const productBrand = product?.brand ?? part.productBrand;
+    const productCategory = product?.category ?? part.productCategory;
+    const productModel = product?.model ?? product?.variant ?? part.productModel;
+
+    if (!part.productId || !productName || !productBrand || !productCategory) continue;
+
+    normalized.push({
+      productId: part.productId,
+      productName,
+      productCategory,
+      productBrand,
+      ...(productModel ? { productModel } : {}),
+      quantity,
+      unitPrice,
+      subtotal: unitPrice * quantity,
+    });
+  }
+
+  return normalized;
+}
+
+function withFinancialTotals(
+  order: Omit<
+    ServiceOrder,
+    "parts" | "partsSubtotal" | "laborTotal" | "finalTotal" | "paidAmount" | "balanceDue" | "statusHistory"
+  > & Partial<Pick<ServiceOrder, "parts" | "partsSubtotal" | "laborTotal" | "finalTotal" | "paidAmount" | "balanceDue" | "statusHistory">>,
+): ServiceOrder {
+  const parts = normalizeParts(order.parts);
+  const partsSubtotal = parts.reduce((total, part) => total + part.subtotal, 0);
+  const laborTotal = toMoney(order.laborCost);
+  const discount = toMoney(order.discount);
+  const advance = toMoney(order.advance);
+  const finalPayment = toMoney(order.finalPayment);
+  const paidAmount = advance + finalPayment;
+  const finalTotal = Math.max(0, partsSubtotal + laborTotal - discount);
+  const balanceDue = Math.max(0, finalTotal - paidAmount);
+  const statusHistory = Array.isArray(order.statusHistory) && order.statusHistory.length > 0
+    ? order.statusHistory
+    : [{ status: order.status, changedAt: order.createdAt }];
+
+  return {
+    ...order,
+    parts,
+    partsSubtotal,
+    laborCost: laborTotal,
+    laborTotal,
+    discount,
+    finalTotal,
+    advance,
+    finalPayment,
+    paidAmount,
+    balanceDue,
+    statusHistory,
+  };
+}
+
+function appendStatusHistory(
+  history: ServiceOrderStatusHistoryEntry[] | undefined,
+  status: RepairStatus,
+  changedAt: string,
+): ServiceOrderStatusHistoryEntry[] {
+  const current = Array.isArray(history) ? history : [];
+  if (current[current.length - 1]?.status === status) return current;
+  return [...current, { status, changedAt }];
 }
 
 export function formatOrderNumber(sequence: number): string {
@@ -82,7 +168,7 @@ export function toPublicOrderStatus(order: ServiceOrder, baseUrl?: string): Publ
 
 export function listServiceOrders(filters: ServiceOrderListFilters = {}): ServiceOrder[] {
   const store = ensureStore();
-  let orders = [...store.orders].sort(
+  let orders = store.orders.map(withFinancialTotals).sort(
     (a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime(),
   );
 
@@ -113,7 +199,8 @@ export function listServiceOrders(filters: ServiceOrderListFilters = {}): Servic
 
 export function getServiceOrderByNumber(orderNumber: string): ServiceOrder | null {
   const store = ensureStore();
-  return store.orders.find((order) => order.orderNumber === orderNumber) ?? null;
+  const order = store.orders.find((item) => item.orderNumber === orderNumber);
+  return order ? withFinancialTotals(order) : null;
 }
 
 export function getServiceOrdersByClientPhone(phone: string): ServiceOrder[] {
@@ -127,7 +214,7 @@ export function createServiceOrder(input: CreateServiceOrderInput): ServiceOrder
   const now = new Date().toISOString();
   const warrantyDays = input.warrantyDays ?? DEFAULT_WARRANTY_DAYS;
 
-  const order: ServiceOrder = {
+  const order: ServiceOrder = withFinancialTotals({
     id: randomUUID(),
     orderNumber: formatOrderNumber(nextSequence),
     createdAt: now,
@@ -145,15 +232,25 @@ export function createServiceOrder(input: CreateServiceOrderInput): ServiceOrder
     physicalCondition: input.physicalCondition.trim(),
     observations: input.observations.trim(),
     estimatedValue: input.estimatedValue,
+    laborCost: input.laborCost,
+    parts: input.parts,
+    discount: input.discount,
+    advance: input.advance,
+    finalPayment: input.finalPayment,
     status: input.status,
+    statusHistory: [{ status: input.status, changedAt: now }],
     technicianName: input.technicianName?.trim() || undefined,
     warrantyDays,
     warrantyExpiresAt: addDays(now, warrantyDays),
-  };
+  });
 
   store.lastSequence = nextSequence;
   store.orders.unshift(order);
   persistStore(store);
+
+  if (order.status !== "Pagada" && order.finalTotal > 0 && order.balanceDue <= 0) {
+    return payServiceOrder(order.orderNumber) ?? order;
+  }
 
   return order;
 }
@@ -167,11 +264,11 @@ export function updateServiceOrder(
 
   if (index === -1) return null;
 
-  const current = store.orders[index];
+  const current = withFinancialTotals(store.orders[index]);
   const now = new Date().toISOString();
   const nextStatus = input.status ?? current.status;
 
-  const updated: ServiceOrder = {
+  const updated: ServiceOrder = withFinancialTotals({
     ...current,
     ...input,
     clientName: input.clientName?.trim() ?? current.clientName,
@@ -188,16 +285,25 @@ export function updateServiceOrder(
     physicalCondition: input.physicalCondition?.trim() ?? current.physicalCondition,
     observations: input.observations?.trim() ?? current.observations,
     accessories: input.accessories ?? current.accessories,
+    parts: input.parts ?? current.parts,
+    laborCost: input.laborCost ?? current.laborCost,
+    discount: input.discount ?? current.discount,
+    advance: input.advance ?? current.advance,
+    finalPayment: input.finalPayment ?? current.finalPayment,
     technicianName:
       input.technicianName !== undefined
         ? input.technicianName.trim() || undefined
         : current.technicianName,
     updatedAt: now,
+    statusHistory:
+      nextStatus !== current.status
+        ? appendStatusHistory(current.statusHistory, nextStatus, now)
+        : current.statusHistory,
     deliveredAt:
       nextStatus === "Entregado" && !current.deliveredAt
         ? now
         : input.deliveredAt ?? current.deliveredAt,
-  };
+  });
 
   if (input.warrantyDays !== undefined) {
     updated.warrantyDays = input.warrantyDays;
@@ -207,7 +313,100 @@ export function updateServiceOrder(
   store.orders[index] = updated;
   persistStore(store);
 
+  if (updated.status !== "Pagada" && updated.finalTotal > 0 && updated.balanceDue <= 0) {
+    return payServiceOrder(orderNumber);
+  }
+
   return updated;
+}
+
+export function deleteServiceOrder(orderNumber: string): boolean {
+  const store = ensureStore();
+  const nextOrders = store.orders.filter((order) => order.orderNumber !== orderNumber);
+  if (nextOrders.length === store.orders.length) return false;
+
+  store.orders = nextOrders;
+  persistStore(store);
+  return true;
+}
+
+export function payServiceOrder(orderNumber: string): ServiceOrder | null {
+  const store = ensureStore();
+  const index = store.orders.findIndex((order) => order.orderNumber === orderNumber);
+  if (index === -1) return null;
+
+  const current = withFinancialTotals(store.orders[index]);
+  if (current.status === "Pagada" && current.paidAt) {
+    const existingRepairSale = getRepairSaleByOrderNumber(current.orderNumber);
+    if (existingRepairSale) return current;
+
+    const repairSale = registerRepairSale({
+      orderNumber: current.orderNumber,
+      clientName: current.clientName,
+      total: current.finalTotal,
+      createdAt: current.paidAt,
+    });
+    const repairedPaidOrder: ServiceOrder = {
+      ...current,
+      saleIds: [...(current.saleIds ?? []), repairSale.id],
+      paidAmount: current.finalTotal,
+      balanceDue: 0,
+      updatedAt: new Date().toISOString(),
+    };
+    store.orders[index] = repairedPaidOrder;
+    persistStore(store);
+    return repairedPaidOrder;
+  }
+
+  const requiredStock = new Map<string, number>();
+  for (const part of current.parts) {
+    requiredStock.set(part.productId, (requiredStock.get(part.productId) ?? 0) + part.quantity);
+  }
+
+  const products = listInventoryProducts();
+  for (const [productId, quantity] of requiredStock) {
+    const product = products.find((item) => item.id === productId);
+    if (!product) throw new Error("Uno de los repuestos ya no existe en inventario.");
+    if (product.stock < quantity) {
+      throw new Error(`Stock insuficiente para ${product.name}. Disponible: ${product.stock}.`);
+    }
+  }
+
+  const saleIds = current.parts.map((part) => {
+    const sale = registerInventorySale({
+      productId: part.productId,
+      quantity: part.quantity,
+      unitPrice: part.unitPrice,
+      source: "service-order-part",
+      orderNumber: current.orderNumber,
+    });
+    return sale.id;
+  });
+
+  const now = new Date().toISOString();
+  const repairSale = registerRepairSale({
+    orderNumber: current.orderNumber,
+    clientName: current.clientName,
+    total: current.finalTotal,
+    createdAt: now,
+  });
+
+  const paidOrder: ServiceOrder = {
+    ...current,
+    status: "Pagada",
+    paidAt: now,
+    deliveredAt: current.deliveredAt ?? now,
+    updatedAt: now,
+    saleIds: [...saleIds, repairSale.id],
+    finalPayment: Math.max(current.finalPayment ?? 0, current.finalTotal - (current.advance ?? 0)),
+    paidAmount: current.finalTotal,
+    balanceDue: 0,
+    statusHistory: appendStatusHistory(current.statusHistory, "Pagada", now),
+  };
+
+  store.orders[index] = paidOrder;
+  persistStore(store);
+  return paidOrder;
 }
 
 export function isValidRepairStatus(value: string): value is RepairStatus {
@@ -217,6 +416,7 @@ export function isValidRepairStatus(value: string): value is RepairStatus {
     "En reparación",
     "Listo",
     "Entregado",
+    "Pagada",
   ].includes(value);
 }
 
@@ -275,6 +475,11 @@ export function validateCreateInput(body: unknown): CreateServiceOrderInput | { 
     physicalCondition: data.physicalCondition as string,
     observations: typeof data.observations === "string" ? data.observations : "",
     estimatedValue,
+    laborCost: toMoney(data.laborCost),
+    parts: Array.isArray(data.parts) ? (data.parts as ServiceOrderPart[]) : [],
+    discount: toMoney(data.discount),
+    advance: toMoney(data.advance),
+    finalPayment: toMoney(data.finalPayment),
     status,
     technicianName: typeof data.technicianName === "string" ? data.technicianName : undefined,
     warrantyDays:

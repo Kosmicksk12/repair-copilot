@@ -7,11 +7,21 @@ import {
   REPAIR_STATUSES,
   type RepairStatus,
   type ServiceOrder,
+  type ServiceOrderPart,
 } from "@/lib/service-order-types";
+import type { InventoryProduct } from "@/lib/inventory-types";
 import { formatCurrency } from "@/lib/format-currency";
 import { formatOrderDate, statusBadgeClass } from "@/lib/service-order-format";
 import { downloadReceiptPdf, printReceipt } from "@/lib/service-order-pdf";
 import { DEFAULT_WARRANTY_DAYS } from "@/lib/warranty-terms";
+import {
+  createServiceOrderForModule,
+  deleteServiceOrderForModule,
+  getAvailablePartsForModule,
+  getServiceOrdersForModule,
+  payServiceOrderForModule,
+  updateServiceOrderForModule,
+} from "./actions";
 
 type FormState = {
   clientName: string;
@@ -26,6 +36,11 @@ type FormState = {
   physicalCondition: string;
   observations: string;
   estimatedValue: string;
+  laborCost: string;
+  discount: string;
+  advance: string;
+  finalPayment: string;
+  parts: ServiceOrderPart[];
   status: RepairStatus;
   technicianName: string;
   warrantyDays: string;
@@ -44,6 +59,11 @@ const emptyForm: FormState = {
   physicalCondition: "",
   observations: "",
   estimatedValue: "",
+  laborCost: "",
+  discount: "",
+  advance: "",
+  finalPayment: "",
+  parts: [],
   status: "Recibido",
   technicianName: "",
   warrantyDays: String(DEFAULT_WARRANTY_DAYS),
@@ -63,6 +83,11 @@ function formFromOrder(order: ServiceOrder): FormState {
     physicalCondition: order.physicalCondition,
     observations: order.observations,
     estimatedValue: order.estimatedValue?.toString() ?? "",
+    laborCost: order.laborCost?.toString() ?? "",
+    discount: order.discount?.toString() ?? "",
+    advance: order.advance?.toString() ?? "",
+    finalPayment: order.finalPayment?.toString() ?? "",
+    parts: order.parts ?? [],
     status: order.status,
     technicianName: order.technicianName ?? "",
     warrantyDays: String(order.warrantyDays ?? DEFAULT_WARRANTY_DAYS),
@@ -77,13 +102,54 @@ function labelClassName() {
   return "mb-1 block text-xs font-medium text-zinc-600";
 }
 
+function toFormNumber(value: string) {
+  const number = Number(value);
+  return Number.isFinite(number) ? Math.max(0, number) : 0;
+}
+
+function productUnitPrice(product: InventoryProduct) {
+  return product.salePrice ?? product.minimumPrice ?? 0;
+}
+
+function productLabel(product: InventoryProduct) {
+  return [product.name, product.brand, product.model ?? product.variant, product.color]
+    .filter(Boolean)
+    .join(" · ");
+}
+
+function calculateFormTotals(form: FormState) {
+  const partsSubtotal = form.parts.reduce((total, part) => total + part.quantity * part.unitPrice, 0);
+  const laborTotal = toFormNumber(form.laborCost);
+  const discount = toFormNumber(form.discount);
+  const advance = toFormNumber(form.advance);
+  const finalPayment = toFormNumber(form.finalPayment);
+  const paidAmount = advance + finalPayment;
+  const finalTotal = Math.max(0, partsSubtotal + laborTotal - discount);
+  const balanceDue = Math.max(0, finalTotal - paidAmount);
+
+  return { partsSubtotal, laborTotal, discount, advance, finalPayment, paidAmount, finalTotal, balanceDue };
+}
+
+function formatCompactDate(value: string) {
+  return new Intl.DateTimeFormat("es-CO", {
+    day: "2-digit",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(value));
+}
+
 export default function ServiceOrdersModule() {
   const [orders, setOrders] = useState<ServiceOrder[]>([]);
+  const [availableParts, setAvailableParts] = useState<InventoryProduct[]>([]);
   const [selectedOrder, setSelectedOrder] = useState<ServiceOrder | null>(null);
   const [search, setSearch] = useState("");
+  const [partSearch, setPartSearch] = useState("");
   const [statusFilter, setStatusFilter] = useState<RepairStatus | "Todos">("Todos");
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
+  const [isPaying, setIsPaying] = useState(false);
   const [error, setError] = useState("");
   const [formOpen, setFormOpen] = useState(false);
   const [formMode, setFormMode] = useState<"create" | "edit">("create");
@@ -96,15 +162,15 @@ export default function ServiceOrdersModule() {
     setIsLoading(true);
     setError("");
     try {
-      const params = new URLSearchParams();
-      if (search.trim()) params.set("search", search.trim());
-      if (statusFilter !== "Todos") params.set("status", statusFilter);
-
-      const response = await fetch(`/api/service-orders?${params.toString()}`);
-      if (!response.ok) throw new Error("No se pudieron cargar las órdenes.");
-
-      const data = (await response.json()) as { orders: ServiceOrder[] };
-      setOrders(data.orders);
+      const [orders, parts] = await Promise.all([
+        getServiceOrdersForModule({
+          search: search.trim() || undefined,
+          status: statusFilter,
+        }),
+        getAvailablePartsForModule(),
+      ]);
+      setOrders(orders);
+      setAvailableParts(parts);
     } catch {
       setError("Error al cargar las órdenes de servicio.");
     } finally {
@@ -151,10 +217,83 @@ export default function ServiceOrdersModule() {
     physicalCondition: form.physicalCondition,
     observations: form.observations,
     estimatedValue: form.estimatedValue ? Number(form.estimatedValue) : undefined,
+    laborCost: toFormNumber(form.laborCost),
+    parts: form.parts,
+    discount: toFormNumber(form.discount),
+    advance: toFormNumber(form.advance),
+    finalPayment: toFormNumber(form.finalPayment),
     status: form.status,
     technicianName: form.technicianName || undefined,
     warrantyDays: form.warrantyDays ? Number(form.warrantyDays) : DEFAULT_WARRANTY_DAYS,
   });
+
+  const filteredPartProducts = availableParts.filter((product) => {
+    const query = partSearch.trim().toLowerCase();
+    if (!query) return true;
+    return productLabel(product).toLowerCase().includes(query) || product.category.toLowerCase().includes(query);
+  });
+
+  const addPart = (product: InventoryProduct) => {
+    const unitPrice = productUnitPrice(product);
+    setForm((prev) => {
+      const existing = prev.parts.find((part) => part.productId === product.id);
+      if (existing) {
+        return {
+          ...prev,
+          parts: prev.parts.map((part) =>
+            part.productId === product.id
+              ? {
+                  ...part,
+                  quantity: Math.min(product.stock, part.quantity + 1),
+                  subtotal: Math.min(product.stock, part.quantity + 1) * part.unitPrice,
+                }
+              : part,
+          ),
+        };
+      }
+
+      return {
+        ...prev,
+        parts: [
+          ...prev.parts,
+          {
+            productId: product.id,
+            productName: product.name,
+            productCategory: product.category,
+            productBrand: product.brand,
+            productModel: product.model ?? product.variant,
+            quantity: 1,
+            unitPrice,
+            subtotal: unitPrice,
+          },
+        ],
+      };
+    });
+  };
+
+  const updatePart = (productId: string, patch: Partial<Pick<ServiceOrderPart, "quantity" | "unitPrice">>) => {
+    const product = availableParts.find((item) => item.id === productId);
+    setForm((prev) => ({
+      ...prev,
+      parts: prev.parts.map((part) => {
+        if (part.productId !== productId) return part;
+        const quantity = patch.quantity !== undefined
+          ? Math.max(1, Math.min(product?.stock ?? patch.quantity, Math.trunc(patch.quantity)))
+          : part.quantity;
+        const unitPrice = patch.unitPrice !== undefined ? Math.max(0, patch.unitPrice) : part.unitPrice;
+        return { ...part, quantity, unitPrice, subtotal: quantity * unitPrice };
+      }),
+    }));
+  };
+
+  const removePart = (productId: string) => {
+    setForm((prev) => ({
+      ...prev,
+      parts: prev.parts.filter((part) => part.productId !== productId),
+    }));
+  };
+
+  const formTotals = calculateFormTotals(form);
 
   const handleSave = async () => {
     if (
@@ -179,33 +318,12 @@ export default function ServiceOrdersModule() {
       const payload = buildPayload();
 
       if (formMode === "create") {
-        const response = await fetch("/api/service-orders", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
-        });
-        if (!response.ok) {
-          const data = (await response.json()) as { error?: string };
-          throw new Error(data.error ?? "No se pudo crear la orden.");
-        }
-        const data = (await response.json()) as { order: ServiceOrder };
-        setSelectedOrder(data.order);
+        const order = await createServiceOrderForModule(payload);
+        setSelectedOrder(order);
         setShowReceipt(true);
       } else if (selectedOrder) {
-        const response = await fetch(
-          `/api/service-orders/${encodeURIComponent(selectedOrder.orderNumber)}`,
-          {
-            method: "PATCH",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload),
-          },
-        );
-        if (!response.ok) {
-          const data = (await response.json()) as { error?: string };
-          throw new Error(data.error ?? "No se pudo actualizar la orden.");
-        }
-        const data = (await response.json()) as { order: ServiceOrder };
-        setSelectedOrder(data.order);
+        const order = await updateServiceOrderForModule(selectedOrder.orderNumber, payload);
+        setSelectedOrder(order);
       }
 
       setFormOpen(false);
@@ -218,22 +336,55 @@ export default function ServiceOrdersModule() {
   };
 
   const handleStatusChange = async (order: ServiceOrder, status: RepairStatus) => {
+    if (status === "Pagada") {
+      await handlePayOrder(order);
+      return;
+    }
+
     setError("");
     try {
-      const response = await fetch(
-        `/api/service-orders/${encodeURIComponent(order.orderNumber)}`,
-        {
-          method: "PATCH",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ status }),
-        },
-      );
-      if (!response.ok) throw new Error("No se pudo actualizar el estado.");
-      const data = (await response.json()) as { order: ServiceOrder };
-      setSelectedOrder(data.order);
+      const updatedOrder = await updateServiceOrderForModule(order.orderNumber, { status });
+      setSelectedOrder(updatedOrder);
       await loadOrders();
     } catch {
       setError("Error al cambiar el estado de la reparación.");
+    }
+  };
+
+  const handleDeleteOrder = async (order: ServiceOrder) => {
+    const confirmed = window.confirm(`¿Eliminar la orden ${order.orderNumber}? Esta acción no se puede deshacer.`);
+    if (!confirmed) return;
+
+    setIsDeleting(true);
+    setError("");
+    try {
+      await deleteServiceOrderForModule(order.orderNumber);
+      if (selectedOrder?.orderNumber === order.orderNumber) {
+        setSelectedOrder(null);
+        setShowReceipt(false);
+      }
+      await loadOrders();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Error al eliminar la orden.");
+    } finally {
+      setIsDeleting(false);
+    }
+  };
+
+  const handlePayOrder = async (order: ServiceOrder) => {
+    const confirmed = window.confirm(`¿Marcar la orden ${order.orderNumber} como pagada? Se descontará el inventario de repuestos.`);
+    if (!confirmed) return;
+
+    setIsPaying(true);
+    setError("");
+    try {
+      const paidOrder = await payServiceOrderForModule(order.orderNumber);
+      setSelectedOrder(paidOrder);
+      await loadOrders();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Error al marcar la orden como pagada.");
+    } finally {
+      setIsPaying(false);
     }
   };
 
@@ -256,184 +407,140 @@ export default function ServiceOrdersModule() {
   };
 
   return (
-    <div className="flex h-full flex-col">
-      <div className="flex h-16 shrink-0 items-center justify-between border-b border-zinc-200/80 bg-white px-6">
-        <div>
-          <h2 className="text-lg font-semibold tracking-tight text-zinc-950">Órdenes de servicio</h2>
-          <p className="text-xs text-zinc-500">Fixit Phone · Comprobante de ingreso y garantía</p>
+    <div className="flex h-full min-h-0 flex-col bg-[#f7f7f5]">
+      <div className="shrink-0 border-b border-zinc-200/80 bg-white px-5 py-3">
+        <div className="flex items-center justify-between gap-4">
+          <div>
+            <h2 className="text-lg font-semibold tracking-tight text-zinc-950">Órdenes de servicio</h2>
+            <p className="text-xs text-zinc-500">Lista operativa y ficha fija de la orden seleccionada.</p>
+          </div>
+          <button
+            type="button"
+            onClick={openCreate}
+            className="inline-flex items-center justify-center rounded-xl bg-zinc-950 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-800"
+          >
+            + Nueva orden
+          </button>
         </div>
-        <button
-          type="button"
-          onClick={openCreate}
-          className="inline-flex items-center rounded-xl bg-zinc-950 px-4 py-2 text-sm font-medium text-white transition hover:bg-zinc-800"
-        >
-          + Nueva orden
-        </button>
       </div>
 
-      <div className="flex min-h-0 flex-1">
-        <div className="flex min-w-0 flex-1 flex-col border-r border-zinc-200/80">
-          <div className="space-y-3 border-b border-zinc-200/80 p-4">
-            <input
-              type="search"
-              placeholder="Buscar por orden, cliente, teléfono, IMEI..."
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              className={inputClassName()}
-            />
-            <div className="flex flex-wrap gap-1.5">
+      <div className="grid min-h-0 flex-1 gap-3 p-3 xl:grid-cols-[390px_minmax(0,1fr)]">
+        <section className="flex min-h-0 flex-col overflow-hidden rounded-2xl border border-zinc-200 bg-white">
+          <div className="space-y-3 border-b border-zinc-100 p-3">
+            <div>
+              <input
+                type="search"
+                placeholder="Buscar orden, cliente, equipo..."
+                value={search}
+                onChange={(e) => setSearch(e.target.value)}
+                className={inputClassName()}
+              />
+            </div>
+            <div className="flex gap-1.5 overflow-x-auto pb-1">
               {(["Todos", ...REPAIR_STATUSES] as const).map((status) => (
                 <button
                   key={status}
                   type="button"
                   onClick={() => setStatusFilter(status)}
                   className={
-                    "rounded-full px-3 py-1.5 text-xs font-medium transition " +
+                    "shrink-0 rounded-full px-3 py-1.5 text-xs font-medium transition " +
                     (statusFilter === status
                       ? "bg-zinc-950 text-white"
-                      : "border border-zinc-200 bg-white text-zinc-600 hover:border-zinc-300")
+                      : "bg-zinc-100 text-zinc-600 hover:bg-zinc-200")
                   }
                 >
                   {status}
                 </button>
               ))}
             </div>
+            {error && !formOpen && (
+              <p className="mt-3 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>
+            )}
           </div>
 
-          <div className="flex-1 overflow-y-auto p-4">
-            {error && !formOpen && (
-              <p className="mb-3 rounded-xl bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>
-            )}
+          <div className="min-h-0 flex-1 overflow-y-auto p-2">
             {isLoading ? (
-              <p className="py-12 text-center text-sm text-zinc-500">Cargando órdenes...</p>
+              <p className="py-16 text-center text-sm text-zinc-500">Cargando órdenes...</p>
             ) : orders.length === 0 ? (
               <div className="py-16 text-center">
                 <p className="text-4xl">📋</p>
                 <p className="mt-3 text-sm text-zinc-500">No hay órdenes registradas</p>
-                <button
-                  type="button"
-                  onClick={openCreate}
-                  className="mt-4 text-sm font-medium text-zinc-900 underline"
-                >
+                <button type="button" onClick={openCreate} className="mt-4 text-sm font-semibold text-zinc-900 underline">
                   Crear la primera orden
                 </button>
               </div>
             ) : (
-              <div className="space-y-2">
-                {orders.map((order) => (
-                  <button
-                    key={order.id}
-                    type="button"
-                    onClick={() => {
-                      setSelectedOrder(order);
-                      setShowReceipt(false);
-                    }}
-                    className={
-                      "w-full rounded-2xl border p-4 text-left transition " +
-                      (selectedOrder?.id === order.id
-                        ? "border-zinc-400 bg-zinc-50 ring-1 ring-zinc-200"
-                        : "border-zinc-200 bg-white hover:border-zinc-300")
-                    }
-                  >
-                    <div className="flex items-start justify-between gap-3">
-                      <div>
-                        <p className="font-semibold text-zinc-950">{order.orderNumber}</p>
-                        <p className="mt-0.5 text-sm text-zinc-700">{order.clientName}</p>
-                        <p className="text-xs text-zinc-500">
-                          {order.brand} {order.model} · {order.clientPhone}
-                        </p>
+              <div className="space-y-1.5">
+                {orders.map((order) => {
+                  const active = selectedOrder?.id === order.id;
+                  return (
+                    <button
+                      key={order.id}
+                      type="button"
+                      onClick={() => {
+                        setSelectedOrder(order);
+                        setShowReceipt(false);
+                      }}
+                      className={
+                        "w-full rounded-xl border px-3 py-2.5 text-left transition " +
+                        (active
+                          ? "border-zinc-400 bg-zinc-50 ring-1 ring-zinc-200"
+                          : "border-transparent bg-white hover:border-zinc-200 hover:bg-zinc-50")
+                      }
+                    >
+                      <div className="flex items-start justify-between gap-2">
+                        <div className="min-w-0">
+                          <p className="truncate text-sm font-semibold text-zinc-950">{order.orderNumber}</p>
+                          <p className="mt-0.5 truncate text-xs text-zinc-600">{order.clientName}</p>
+                        </div>
+                        <span className={"shrink-0 rounded-full px-2 py-0.5 text-[10px] font-semibold ring-1 " + statusBadgeClass(order.status)}>
+                          {order.status}
+                        </span>
                       </div>
-                      <span
-                        className={
-                          "shrink-0 rounded-full px-2.5 py-1 text-[10px] font-semibold ring-1 " +
-                          statusBadgeClass(order.status)
-                        }
-                      >
-                        {order.status}
-                      </span>
-                    </div>
-                    <p className="mt-2 text-xs text-zinc-400">{formatOrderDate(order.createdAt)}</p>
-                  </button>
-                ))}
+                      <div className="mt-2 grid grid-cols-[minmax(0,1fr)_auto] items-end gap-2">
+                        <div className="min-w-0">
+                          <p className="truncate text-xs text-zinc-500">{order.brand} {order.model} · {order.technicianName ?? "Sin técnico"}</p>
+                          <p className="mt-0.5 text-[11px] text-zinc-400">{formatCompactDate(order.createdAt)}</p>
+                        </div>
+                        <div className="text-right">
+                          <p className="text-xs font-semibold text-zinc-950">{formatCurrency(order.finalTotal)}</p>
+                          <p className={order.balanceDue > 0 ? "text-[11px] font-medium text-amber-700" : "text-[11px] font-medium text-emerald-700"}>
+                            Saldo {formatCurrency(order.balanceDue)}
+                          </p>
+                        </div>
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
             )}
           </div>
-        </div>
+        </section>
 
-        <div className="hidden w-[420px] shrink-0 flex-col bg-[#fbfbfa] xl:flex">
+        <aside className="min-h-0 overflow-hidden rounded-2xl border border-zinc-200 bg-white">
           {selectedOrder ? (
-            <>
-              <div className="space-y-3 border-b border-zinc-200/80 p-4">
-                <div className="flex items-start justify-between gap-2">
+            <div className="flex h-full min-h-0 flex-col">
+              <div className="border-b border-zinc-200 bg-white p-3">
+                <div className="flex items-start justify-between gap-3">
                   <div>
-                    <p className="text-lg font-semibold text-zinc-950">{selectedOrder.orderNumber}</p>
-                    <p className="text-xs text-zinc-500">{formatOrderDate(selectedOrder.createdAt)}</p>
+                    <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-zinc-400">Orden seleccionada</p>
+                    <h3 className="mt-1 text-lg font-semibold text-zinc-950">{selectedOrder.orderNumber}</h3>
+                    <p className="mt-0.5 text-xs text-zinc-500">{formatCompactDate(selectedOrder.createdAt)}</p>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => openEdit(selectedOrder)}
-                    className="rounded-lg border border-zinc-200 bg-white px-2.5 py-1 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
-                  >
-                    Editar
-                  </button>
-                </div>
-
-                <div>
-                  <label htmlFor="order-status" className={labelClassName()}>
-                    Estado de la reparación
-                  </label>
-                  <select
-                    id="order-status"
-                    value={selectedOrder.status}
-                    onChange={(e) =>
-                      void handleStatusChange(selectedOrder, e.target.value as RepairStatus)
-                    }
-                    className={inputClassName()}
-                  >
-                    {REPAIR_STATUSES.map((status) => (
-                      <option key={status} value={status}>
-                        {status}
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="flex gap-2">
-                  <button
-                    type="button"
-                    onClick={() => setShowReceipt(true)}
-                    className="flex-1 rounded-xl bg-zinc-950 px-3 py-2 text-xs font-medium text-white hover:bg-zinc-800"
-                  >
-                    Ver comprobante
-                  </button>
-                  <a
-                    href={`/orden/${encodeURIComponent(selectedOrder.orderNumber)}`}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="flex-1 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-center text-xs font-medium text-zinc-700 hover:bg-zinc-50"
-                  >
-                    Vista pública
-                  </a>
+                  <span className={"shrink-0 rounded-full px-3 py-1 text-xs font-semibold ring-1 " + statusBadgeClass(selectedOrder.status)}>
+                    {selectedOrder.status}
+                  </span>
                 </div>
               </div>
 
-              <div className="flex-1 overflow-y-auto p-4">
+              <div className="min-h-0 flex-1 overflow-y-auto p-3">
                 {showReceipt ? (
                   <div ref={receiptRef} className="space-y-3">
-                    <div className="flex gap-2 print:hidden">
-                      <button
-                        type="button"
-                        onClick={handlePrint}
-                        className="flex-1 rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs font-medium text-zinc-700 hover:bg-zinc-50"
-                      >
+                    <div className="grid grid-cols-2 gap-2 print:hidden">
+                      <button type="button" onClick={handlePrint} className="rounded-xl border border-zinc-200 bg-white px-3 py-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-50">
                         Imprimir
                       </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleDownloadPdf()}
-                        disabled={isPdfLoading}
-                        className="flex-1 rounded-xl bg-zinc-950 px-3 py-2 text-xs font-medium text-white hover:bg-zinc-800 disabled:opacity-60"
-                      >
+                      <button type="button" onClick={() => void handleDownloadPdf()} disabled={isPdfLoading} className="rounded-xl bg-zinc-950 px-3 py-2 text-xs font-semibold text-white hover:bg-zinc-800 disabled:opacity-60">
                         {isPdfLoading ? "Generando..." : "Descargar PDF"}
                       </button>
                     </div>
@@ -445,26 +552,55 @@ export default function ServiceOrdersModule() {
                   <OrderDetailSummary order={selectedOrder} />
                 )}
               </div>
-            </>
+
+              <div className="grid grid-cols-5 gap-2 border-t border-zinc-200 bg-white p-3">
+                <button type="button" onClick={() => openEdit(selectedOrder)} className="rounded-xl border border-zinc-200 bg-white px-2 py-2 text-xs font-semibold text-zinc-700 hover:bg-zinc-50">
+                  Editar
+                </button>
+                <button type="button" onClick={() => setShowReceipt((value) => !value)} className="rounded-xl bg-zinc-950 px-2 py-2 text-xs font-semibold text-white hover:bg-zinc-800">
+                  {showReceipt ? "Detalle" : "Recibo"}
+                </button>
+                <a href={`/orden/${encodeURIComponent(selectedOrder.orderNumber)}`} target="_blank" rel="noreferrer" className="rounded-xl border border-zinc-200 bg-white px-2 py-2 text-center text-xs font-semibold text-zinc-700 hover:bg-zinc-50">
+                  Pública
+                </a>
+                <button
+                  type="button"
+                  onClick={() => void handlePayOrder(selectedOrder)}
+                  disabled={selectedOrder.status === "Pagada" || isPaying}
+                  className="rounded-xl bg-emerald-600 px-2 py-2 text-xs font-semibold text-white hover:bg-emerald-700 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Pago
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleDeleteOrder(selectedOrder)}
+                  disabled={isDeleting}
+                  className="rounded-xl border border-red-200 bg-red-50 px-2 py-2 text-xs font-semibold text-red-700 hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  Borrar
+                </button>
+              </div>
+            </div>
           ) : (
-            <div className="flex flex-1 items-center justify-center p-6 text-center">
+            <div className="flex h-full items-center justify-center p-8 text-center">
               <div>
                 <p className="text-4xl">🧾</p>
-                <p className="mt-3 text-sm text-zinc-500">
-                  Selecciona una orden para ver detalle, comprobante e imprimir.
+                <h3 className="mt-4 text-base font-semibold text-zinc-950">Selecciona una orden</h3>
+                <p className="mt-2 text-sm leading-6 text-zinc-500">
+                  El panel lateral mostrará cliente, equipo, timeline, finanzas, garantía y acciones.
                 </p>
               </div>
             </div>
           )}
-        </div>
+        </aside>
       </div>
 
       {formOpen && (
-        <div className="fixed inset-0 z-50 flex items-end justify-center bg-zinc-950/40 p-4 sm:items-center">
+        <div className="fixed inset-0 z-50 flex justify-end bg-zinc-950/30">
           <div
             role="dialog"
             aria-modal="true"
-            className="max-h-[92vh] w-full max-w-2xl overflow-y-auto rounded-[24px] border border-zinc-200 bg-white p-6 shadow-xl"
+            className="h-full w-full max-w-xl overflow-y-auto border-l border-zinc-200 bg-white p-5 shadow-2xl"
           >
             <h3 className="text-base font-semibold text-zinc-950">
               {formMode === "create" ? "Nueva orden de servicio" : "Editar orden"}
@@ -613,6 +749,96 @@ export default function ServiceOrdersModule() {
 
               <section>
                 <h4 className="mb-3 text-xs font-bold uppercase tracking-wider text-zinc-500">
+                  Repuestos utilizados
+                </h4>
+                <div className="space-y-3">
+                  <input
+                    type="search"
+                    placeholder="Buscar repuesto en inventario con stock..."
+                    value={partSearch}
+                    onChange={(e) => setPartSearch(e.target.value)}
+                    className={inputClassName()}
+                  />
+                  <div className="max-h-40 overflow-y-auto rounded-xl border border-zinc-200">
+                    {filteredPartProducts.slice(0, 8).map((product) => (
+                      <button
+                        key={product.id}
+                        type="button"
+                        onClick={() => addPart(product)}
+                        className="flex w-full items-center justify-between gap-3 border-b border-zinc-100 px-3 py-2 text-left text-xs last:border-0 hover:bg-zinc-50"
+                      >
+                        <span>
+                          <span className="block font-medium text-zinc-800">{productLabel(product)}</span>
+                          <span className="text-zinc-400">Stock {product.stock} · {product.category}</span>
+                        </span>
+                        <span className="font-semibold text-zinc-700">{formatCurrency(productUnitPrice(product))}</span>
+                      </button>
+                    ))}
+                    {filteredPartProducts.length === 0 && (
+                      <p className="px-3 py-6 text-center text-xs text-zinc-400">
+                        No hay repuestos con stock para esa búsqueda.
+                      </p>
+                    )}
+                  </div>
+
+                  <div className="space-y-2">
+                    {form.parts.length === 0 ? (
+                      <p className="rounded-xl bg-zinc-50 px-3 py-3 text-xs text-zinc-500">
+                        Aún no hay repuestos agregados a esta orden.
+                      </p>
+                    ) : (
+                      form.parts.map((part) => (
+                        <div key={part.productId} className="rounded-xl border border-zinc-200 p-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <p className="text-sm font-medium text-zinc-900">{part.productName}</p>
+                              <p className="text-xs text-zinc-500">{part.productBrand} · {part.productCategory}</p>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => removePart(part.productId)}
+                              className="text-xs font-medium text-red-600 hover:text-red-700"
+                            >
+                              Quitar
+                            </button>
+                          </div>
+                          <div className="mt-3 grid gap-2 sm:grid-cols-3">
+                            <label>
+                              <span className={labelClassName()}>Cantidad</span>
+                              <input
+                                type="number"
+                                min="1"
+                                value={part.quantity}
+                                onChange={(e) => updatePart(part.productId, { quantity: Number(e.target.value) })}
+                                className={inputClassName()}
+                              />
+                            </label>
+                            <label>
+                              <span className={labelClassName()}>Precio unitario</span>
+                              <input
+                                type="number"
+                                min="0"
+                                value={part.unitPrice}
+                                onChange={(e) => updatePart(part.productId, { unitPrice: Number(e.target.value) })}
+                                className={inputClassName()}
+                              />
+                            </label>
+                            <div className="rounded-xl bg-zinc-50 p-3">
+                              <p className="text-xs text-zinc-500">Subtotal</p>
+                              <p className="mt-1 text-sm font-semibold text-zinc-900">
+                                {formatCurrency(part.quantity * part.unitPrice)}
+                              </p>
+                            </div>
+                          </div>
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              </section>
+
+              <section>
+                <h4 className="mb-3 text-xs font-bold uppercase tracking-wider text-zinc-500">
                   Comercial y estado
                 </h4>
                 <div className="grid gap-3 sm:grid-cols-2">
@@ -627,6 +853,46 @@ export default function ServiceOrdersModule() {
                     />
                   </div>
                   <div>
+                    <label className={labelClassName()}>Mano de obra</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={form.laborCost}
+                      onChange={(e) => setForm({ ...form, laborCost: e.target.value })}
+                      className={inputClassName()}
+                    />
+                  </div>
+                  <div>
+                    <label className={labelClassName()}>Descuento</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={form.discount}
+                      onChange={(e) => setForm({ ...form, discount: e.target.value })}
+                      className={inputClassName()}
+                    />
+                  </div>
+                  <div>
+                    <label className={labelClassName()}>Anticipo</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={form.advance}
+                      onChange={(e) => setForm({ ...form, advance: e.target.value })}
+                      className={inputClassName()}
+                    />
+                  </div>
+                  <div>
+                    <label className={labelClassName()}>Pago final</label>
+                    <input
+                      type="number"
+                      min="0"
+                      value={form.finalPayment}
+                      onChange={(e) => setForm({ ...form, finalPayment: e.target.value })}
+                      className={inputClassName()}
+                    />
+                  </div>
+                  <div>
                     <label className={labelClassName()}>Estado</label>
                     <select
                       value={form.status}
@@ -636,7 +902,7 @@ export default function ServiceOrdersModule() {
                       className={inputClassName()}
                     >
                       {REPAIR_STATUSES.map((status) => (
-                        <option key={status} value={status}>
+                        <option key={status} value={status} disabled={status === "Pagada"}>
                           {status}
                         </option>
                       ))}
@@ -659,6 +925,24 @@ export default function ServiceOrdersModule() {
                       onChange={(e) => setForm({ ...form, warrantyDays: e.target.value })}
                       className={inputClassName()}
                     />
+                  </div>
+                </div>
+                <div className="mt-4 grid gap-2 sm:grid-cols-4">
+                  <div className="rounded-xl bg-zinc-50 p-3">
+                    <p className="text-xs text-zinc-500">Subtotal repuestos</p>
+                    <p className="mt-1 text-sm font-semibold">{formatCurrency(formTotals.partsSubtotal)}</p>
+                  </div>
+                  <div className="rounded-xl bg-zinc-50 p-3">
+                    <p className="text-xs text-zinc-500">Total final</p>
+                    <p className="mt-1 text-sm font-semibold">{formatCurrency(formTotals.finalTotal)}</p>
+                  </div>
+                  <div className="rounded-xl bg-zinc-50 p-3">
+                    <p className="text-xs text-zinc-500">Pagado</p>
+                    <p className="mt-1 text-sm font-semibold">{formatCurrency(formTotals.paidAmount)}</p>
+                  </div>
+                  <div className="rounded-xl bg-zinc-50 p-3">
+                    <p className="text-xs text-zinc-500">Saldo pendiente</p>
+                    <p className="mt-1 text-sm font-semibold">{formatCurrency(formTotals.balanceDue)}</p>
                   </div>
                 </div>
               </section>
@@ -697,58 +981,104 @@ export default function ServiceOrdersModule() {
 
 function OrderDetailSummary({ order }: { order: ServiceOrder }) {
   return (
-    <div className="space-y-4">
-      <DetailBlock title="Cliente">
-        <DetailRow label="Nombre" value={order.clientName} />
-        <DetailRow label="Teléfono" value={order.clientPhone} />
-      </DetailBlock>
-      <DetailBlock title="Equipo">
-        <DetailRow label="Marca / Modelo" value={`${order.brand} ${order.model}`} />
-        <DetailRow label="Color" value={order.color} />
-        <DetailRow label="IMEI" value={order.imei ?? "—"} />
-      </DetailBlock>
-      <DetailBlock title="Reparación">
-        <DetailRow label="Daño reportado" value={order.reportedDamage} />
-        {order.technicalDiagnosis && (
-          <DetailRow label="Diagnóstico" value={order.technicalDiagnosis} />
-        )}
-        <DetailRow
-          label="Accesorios"
-          value={order.accessories.length ? order.accessories.join(", ") : "Ninguno"}
-        />
-        <DetailRow label="Estado físico" value={order.physicalCondition} />
-        <DetailRow label="Observaciones" value={order.observations || "—"} />
-        <DetailRow label="Valor estimado" value={formatCurrency(order.estimatedValue)} />
-      </DetailBlock>
-      <DetailBlock title="Garantía">
-        <DetailRow
-          label="Vigencia"
-          value={
-            order.warrantyExpiresAt
-              ? formatOrderDate(order.warrantyExpiresAt)
-              : `${order.warrantyDays ?? 90} días`
-          }
-        />
-        <DetailRow label="Técnico" value={order.technicianName ?? "—"} />
-      </DetailBlock>
+    <div className="space-y-3">
+      <section className="rounded-2xl border border-zinc-200 bg-white p-4">
+        <div className="grid grid-cols-2 gap-3">
+          <CompactFact label="Cliente" value={order.clientName} helper={order.clientPhone} />
+          <CompactFact label="Equipo" value={`${order.brand} ${order.model}`} helper={[order.color, order.imei].filter(Boolean).join(" · ") || "Sin detalle"} />
+        </div>
+        <div className="mt-3 rounded-xl bg-zinc-50 p-3">
+          <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">Reporte</p>
+          <p className="mt-1 text-sm leading-5 text-zinc-800">{order.reportedDamage}</p>
+          {order.technicalDiagnosis && (
+            <p className="mt-2 text-xs leading-5 text-zinc-500">Diagnóstico: {order.technicalDiagnosis}</p>
+          )}
+        </div>
+      </section>
+
+      <section className="rounded-2xl border border-zinc-200 bg-white p-4">
+        <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500">Timeline de reparación</h4>
+        <div className="mt-4 space-y-3">
+          {order.statusHistory.map((entry, index) => (
+            <div key={`${entry.status}-${entry.changedAt}-${index}`} className="grid grid-cols-[auto_minmax(0,1fr)] gap-3">
+              <span className="mt-1 h-2.5 w-2.5 rounded-full bg-zinc-950 ring-4 ring-zinc-100" />
+              <div>
+                <p className="text-sm font-semibold text-zinc-900">{entry.status}</p>
+                <p className="text-xs text-zinc-500">{formatOrderDate(entry.changedAt)}</p>
+              </div>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="rounded-2xl border border-zinc-200 bg-white p-4">
+        <div className="flex items-center justify-between gap-3">
+          <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500">Resumen financiero</h4>
+          <p className={order.balanceDue > 0 ? "text-sm font-bold text-amber-700" : "text-sm font-bold text-emerald-700"}>
+            {order.balanceDue > 0 ? "Saldo pendiente" : "Sin saldo"}
+          </p>
+        </div>
+        <div className="mt-4 grid grid-cols-2 gap-2">
+          <MiniMoney label="Mano de obra" value={order.laborTotal} />
+          <MiniMoney label="Repuestos" value={order.partsSubtotal} />
+          <MiniMoney label="Anticipo" value={order.advance ?? 0} />
+          <MiniMoney label="Pago" value={order.finalPayment ?? 0} />
+        </div>
+        <div className="mt-3 rounded-2xl bg-zinc-950 p-4 text-white">
+          <div className="flex items-center justify-between">
+            <span className="text-xs text-zinc-300">Total final</span>
+            <span className="text-lg font-semibold">{formatCurrency(order.finalTotal)}</span>
+          </div>
+          <div className="mt-2 flex items-center justify-between border-t border-white/10 pt-2">
+            <span className="text-xs text-zinc-300">Saldo</span>
+            <span className="text-lg font-semibold">{formatCurrency(order.balanceDue)}</span>
+          </div>
+        </div>
+      </section>
+
+      <section className="rounded-2xl border border-zinc-200 bg-white p-4">
+        <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500">Repuestos utilizados</h4>
+        <div className="mt-3 space-y-2">
+          {order.parts.length > 0 ? order.parts.map((part) => (
+            <div key={part.productId} className="flex items-center justify-between gap-3 rounded-xl bg-zinc-50 p-3">
+              <div className="min-w-0">
+                <p className="truncate text-sm font-semibold text-zinc-900">{part.productName}</p>
+                <p className="text-xs text-zinc-500">{part.quantity} x {formatCurrency(part.unitPrice)}</p>
+              </div>
+              <p className="text-sm font-semibold text-zinc-950">{formatCurrency(part.subtotal)}</p>
+            </div>
+          )) : (
+            <p className="rounded-xl bg-zinc-50 p-3 text-sm text-zinc-500">Sin repuestos registrados.</p>
+          )}
+        </div>
+      </section>
+
+      <section className="rounded-2xl border border-zinc-200 bg-white p-4">
+        <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500">Garantía</h4>
+        <div className="mt-3 grid grid-cols-2 gap-3">
+          <CompactFact label="Vigencia" value={order.warrantyExpiresAt ? formatCompactDate(order.warrantyExpiresAt) : "—"} helper={`${order.warrantyDays ?? 90} días`} />
+          <CompactFact label="Técnico" value={order.technicianName ?? "—"} helper={order.paidAt ? `Pago: ${formatCompactDate(order.paidAt)}` : "Pago pendiente"} />
+        </div>
+      </section>
     </div>
   );
 }
 
-function DetailBlock({ title, children }: { title: string; children: React.ReactNode }) {
+function CompactFact({ label, value, helper }: { label: string; value: string; helper: string }) {
   return (
-    <section className="rounded-2xl border border-zinc-200 bg-white p-4">
-      <h4 className="text-xs font-bold uppercase tracking-wider text-zinc-500">{title}</h4>
-      <div className="mt-3 space-y-2">{children}</div>
-    </section>
+    <div className="min-w-0 rounded-xl bg-zinc-50 p-3">
+      <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">{label}</p>
+      <p className="mt-1 truncate text-sm font-semibold text-zinc-900">{value}</p>
+      <p className="mt-0.5 truncate text-xs text-zinc-500">{helper}</p>
+    </div>
   );
 }
 
-function DetailRow({ label, value }: { label: string; value: string }) {
+function MiniMoney({ label, value }: { label: string; value: number }) {
   return (
-    <div>
-      <p className="text-[10px] font-medium text-zinc-400">{label}</p>
-      <p className="text-sm leading-6 text-zinc-800">{value}</p>
+    <div className="rounded-xl bg-zinc-50 p-3">
+      <p className="text-[10px] font-semibold uppercase tracking-wider text-zinc-400">{label}</p>
+      <p className="mt-1 text-sm font-semibold text-zinc-950">{formatCurrency(value)}</p>
     </div>
   );
 }

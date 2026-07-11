@@ -1,13 +1,14 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
 import KnowledgeBase from "./KnowledgeBase";
 import ServiceOrdersModule from "./service-orders/ServiceOrdersModule";
 import { ChatLayout } from "./copilot";
 import { formatCurrency } from "@/lib/format-currency";
 import type { InventoryProduct } from "@/lib/inventory-types";
 import type { ServiceOrder } from "@/lib/service-order-types";
+import type { MonthlySalesSummary } from "@/lib/sales-types";
 
 const navigation = [
   "Dashboard",
@@ -18,7 +19,11 @@ const navigation = [
 
 type View = (typeof navigation)[number];
 
-export default function RepairCopilotDashboard() {
+type RepairCopilotDashboardProps = {
+  initialDashboardData: DashboardData;
+};
+
+export default function RepairCopilotDashboard({ initialDashboardData }: RepairCopilotDashboardProps) {
   const [activeView, setActiveView] = useState<View>("Copiloto de asesores");
 
   return (
@@ -38,7 +43,7 @@ export default function RepairCopilotDashboard() {
           ) : activeView === "Dashboard" ? (
             <div className="px-4 py-6 sm:px-6 lg:px-8">
               <div className="mx-auto max-w-7xl">
-                <PerformanceDashboard />
+                <PerformanceDashboard initialData={initialDashboardData} />
               </div>
             </div>
           ) : (
@@ -94,6 +99,12 @@ function Sidebar({
         >
           <span>Inventario</span>
         </Link>
+        <Link
+          href="/clientes"
+          className="flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm text-zinc-500 transition hover:bg-white hover:text-zinc-900"
+        >
+          <span>Clientes</span>
+        </Link>
       </nav>
       <div className="mt-8 rounded-2xl border border-zinc-200 bg-white p-4">
         <p className="text-xs font-medium uppercase tracking-[0.16em] text-zinc-400">Dataset</p>
@@ -136,6 +147,8 @@ function Topbar({ activeView }: { activeView: View }) {
 type DashboardData = {
   orders: ServiceOrder[];
   products: InventoryProduct[];
+  monthlySales: MonthlySalesSummary;
+  monthlyHistory: MonthlySalesSummary[];
 };
 
 type DashboardActivity = {
@@ -146,62 +159,27 @@ type DashboardActivity = {
   kind: "order" | "inventory";
 };
 
-function PerformanceDashboard() {
-  const [data, setData] = useState<DashboardData>({ orders: [], products: [] });
-  const [isLoading, setIsLoading] = useState(true);
-  const [loadError, setLoadError] = useState("");
-
-  useEffect(() => {
-    let cancelled = false;
-
-    Promise.all([fetch("/api/service-orders"), fetch("/api/inventory")])
-      .then(async ([ordersResponse, inventoryResponse]) => {
-        if (!ordersResponse.ok || !inventoryResponse.ok) {
-          throw new Error("Dashboard data request failed");
-        }
-
-        const [ordersPayload, inventoryPayload] = (await Promise.all([
-          ordersResponse.json(),
-          inventoryResponse.json(),
-        ])) as [{ orders?: ServiceOrder[] }, { products?: InventoryProduct[] }];
-
-        if (!cancelled) {
-          setData({
-            orders: ordersPayload.orders ?? [],
-            products: inventoryPayload.products ?? [],
-          });
-        }
-      })
-      .catch(() => {
-        if (!cancelled) setLoadError("No fue posible cargar los indicadores del panel.");
-      })
-      .finally(() => {
-        if (!cancelled) setIsLoading(false);
-      });
-
-    return () => {
-      cancelled = true;
-    };
-  }, []);
+function PerformanceDashboard({ initialData }: { initialData: DashboardData }) {
+  const data = initialData;
+  const isLoading = false;
 
   const performance = useMemo(() => {
     const activeRepairs = data.orders.filter((order) => {
       const status = normalizeDashboardText(order.status);
-      return status !== "recibido" && status !== "listo" && status !== "entregado";
+      return status !== "recibido" && status !== "listo" && status !== "entregado" && status !== "pagada";
     }).length;
     const pendingOrders = data.orders.filter(
-      (order) => normalizeDashboardText(order.status) !== "entregado",
+      (order) => !["entregado", "pagada"].includes(normalizeDashboardText(order.status)),
     ).length;
-    const salesToday = data.orders
-      .filter((order) => order.deliveredAt && isDashboardToday(order.deliveredAt))
-      .reduce((total, order) => total + (order.estimatedValue ?? 0), 0);
+    const monthlySales = data.monthlySales;
+    const monthlyHistory = data.monthlyHistory;
     const lowStock = data.products
       .filter((product) => product.stock <= product.lowStockThreshold)
       .sort((left, right) => left.stock - right.stock || left.name.localeCompare(right.name));
 
     const productSales = new Map<string, { name: string; count: number }>();
     data.orders
-      .filter((order) => normalizeDashboardText(order.status) === "entregado")
+      .filter((order) => ["entregado", "pagada"].includes(normalizeDashboardText(order.status)))
       .forEach((order) => {
         const name = [order.brand, order.model].filter(Boolean).join(" ");
         const key = normalizeDashboardText(name);
@@ -231,7 +209,7 @@ function PerformanceDashboard() {
       .sort((left, right) => new Date(right.date).getTime() - new Date(left.date).getTime())
       .slice(0, 7);
 
-    return { activeRepairs, pendingOrders, salesToday, lowStock, topProducts, activities };
+    return { activeRepairs, pendingOrders, monthlySales, monthlyHistory, lowStock, topProducts, activities };
   }, [data]);
 
   return (
@@ -246,18 +224,58 @@ function PerformanceDashboard() {
         </p>
       </div>
 
-      {loadError && (
-        <div role="alert" className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
-          {loadError}
-        </div>
-      )}
-
       <div className="grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
         <DashboardMetric label="Reparaciones activas" value={isLoading ? "—" : performance.activeRepairs} helper="En diagnóstico o reparación" accent="emerald" />
         <DashboardMetric label="Órdenes pendientes" value={isLoading ? "—" : performance.pendingOrders} helper="Por completar o entregar" accent="amber" />
-        <DashboardMetric label="Ventas del día" value={isLoading ? "—" : formatCurrency(performance.salesToday)} helper="Órdenes entregadas hoy" accent="blue" />
+        <DashboardMetric
+          label="Ventas del mes"
+          value={isLoading ? "—" : formatCurrency(performance.monthlySales.totalSold)}
+          helper={`Reparaciones ${formatCurrency(performance.monthlySales.totalRepairs)} · Accesorios ${formatCurrency(performance.monthlySales.totalAccessories)}`}
+          accent="blue"
+        />
         <DashboardMetric label="Stock bajo" value={isLoading ? "—" : performance.lowStock.length} helper="Productos en o bajo el mínimo" accent="red" />
       </div>
+
+      <section className="rounded-lg border border-zinc-200 bg-white shadow-[0_1px_2px_rgba(18,18,18,0.04)]">
+        <DashboardSectionHeader title="Historial mensual" subtitle="Reparaciones pagadas y ventas rápidas" />
+        <div className="overflow-x-auto">
+          <table className="w-full min-w-[760px] border-collapse text-sm">
+            <thead>
+              <tr className="border-b border-zinc-100 bg-zinc-50 text-left text-xs uppercase tracking-wider text-zinc-500">
+                <th className="px-5 py-3 font-semibold">Mes</th>
+                <th className="px-5 py-3 font-semibold">Año</th>
+                <th className="px-5 py-3 font-semibold">Total vendido</th>
+                <th className="px-5 py-3 font-semibold">Reparaciones</th>
+                <th className="px-5 py-3 font-semibold">Accesorios</th>
+                <th className="px-5 py-3 font-semibold">Cantidad</th>
+              </tr>
+            </thead>
+            <tbody>
+              {performance.monthlyHistory.length === 0 ? (
+                <tr>
+                  <td colSpan={6} className="px-5 py-8 text-center text-zinc-400">
+                    Aún no hay ventas mensuales registradas.
+                  </td>
+                </tr>
+              ) : (
+                performance.monthlyHistory.map((summary) => (
+                  <tr key={summary.monthKey} className="border-b border-zinc-100 last:border-0">
+                    <td className="px-5 py-3 font-medium text-zinc-950">{formatDashboardMonth(summary.month)}</td>
+                    <td className="px-5 py-3 text-zinc-600">{summary.year}</td>
+                    <td className="px-5 py-3 font-semibold text-zinc-950">{formatCurrency(summary.totalSold)}</td>
+                    <td className="px-5 py-3 text-zinc-700">{formatCurrency(summary.totalRepairs)}</td>
+                    <td className="px-5 py-3 text-zinc-700">{formatCurrency(summary.totalAccessories)}</td>
+                    <td className="px-5 py-3 text-zinc-700">
+                      {summary.repairsCount} {summary.repairsCount === 1 ? "reparación" : "reparaciones"}
+                      {summary.accessoriesCount > 0 ? ` · ${summary.accessoriesCount} accesorios` : ""}
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </section>
 
       <div className="grid gap-5 xl:grid-cols-[1.05fr_0.95fr]">
         <section className="rounded-lg border border-zinc-200 bg-white shadow-[0_1px_2px_rgba(18,18,18,0.04)]">
@@ -358,16 +376,14 @@ function normalizeDashboardText(value: string) {
   return value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim().toLowerCase();
 }
 
-function isDashboardToday(value: string) {
-  const date = new Date(value);
-  const today = new Date();
-  return date.getFullYear() === today.getFullYear() && date.getMonth() === today.getMonth() && date.getDate() === today.getDate();
-}
-
 function formatDashboardDate(value: string) {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "Sin fecha";
   return new Intl.DateTimeFormat("es-CO", { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" }).format(date);
+}
+
+function formatDashboardMonth(month: number) {
+  return new Intl.DateTimeFormat("es-CO", { month: "long" }).format(new Date(2026, month - 1, 1));
 }
 
 function LogoMark() {

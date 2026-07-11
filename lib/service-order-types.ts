@@ -4,6 +4,7 @@ export const REPAIR_STATUSES = [
   "En reparación",
   "Listo",
   "Entregado",
+  "Pagada",
 ] as const;
 
 export type RepairStatus = (typeof REPAIR_STATUSES)[number];
@@ -19,6 +20,22 @@ export const ACCESSORY_OPTIONS = [
 ] as const;
 
 export type AccessoryOption = (typeof ACCESSORY_OPTIONS)[number];
+
+export type ServiceOrderPart = {
+  productId: string;
+  productName: string;
+  productCategory: string;
+  productBrand: string;
+  productModel?: string;
+  quantity: number;
+  unitPrice: number;
+  subtotal: number;
+};
+
+export type ServiceOrderStatusHistoryEntry = {
+  status: RepairStatus;
+  changedAt: string;
+};
 
 export type ServiceOrder = {
   id: string;
@@ -38,17 +55,44 @@ export type ServiceOrder = {
   physicalCondition: string;
   observations: string;
   estimatedValue?: number;
+  laborCost?: number;
+  parts: ServiceOrderPart[];
+  partsSubtotal: number;
+  laborTotal: number;
+  discount?: number;
+  finalTotal: number;
+  advance?: number;
+  finalPayment?: number;
+  paidAmount: number;
+  balanceDue: number;
   status: RepairStatus;
+  statusHistory: ServiceOrderStatusHistoryEntry[];
   technicianName?: string;
   warrantyDays?: number;
   warrantyExpiresAt?: string;
   deliveredAt?: string;
+  paidAt?: string;
+  saleIds?: string[];
 };
 
 export type CreateServiceOrderInput = Omit<
   ServiceOrder,
-  "id" | "orderNumber" | "createdAt" | "updatedAt" | "warrantyExpiresAt" | "deliveredAt"
+  | "id"
+  | "orderNumber"
+  | "createdAt"
+  | "updatedAt"
+  | "warrantyExpiresAt"
+  | "deliveredAt"
+  | "paidAt"
+  | "saleIds"
+  | "partsSubtotal"
+  | "laborTotal"
+  | "finalTotal"
+  | "paidAmount"
+  | "balanceDue"
+  | "statusHistory"
 > & {
+  parts?: ServiceOrderPart[];
   warrantyDays?: number;
 };
 

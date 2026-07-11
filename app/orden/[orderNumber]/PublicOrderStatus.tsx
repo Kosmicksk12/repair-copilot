@@ -10,6 +10,7 @@ const STATUS_STEPS = [
   "En reparación",
   "Listo",
   "Entregado",
+  "Pagada",
 ] as const;
 
 export default function PublicOrderStatus({
